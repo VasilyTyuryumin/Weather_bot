@@ -4,6 +4,7 @@ import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import seaborn as sns
 import io
 import pandas as pd
@@ -24,9 +25,7 @@ logging.basicConfig(
 
 
 def format_date(date_str):
-    """
-    Форматирует строку даты из '%Y-%m-%d' или '%Y-%m-%d %H:%M' в русский текст.
-    """
+    """Форматирует '%Y-%m-%d' или '%Y-%m-%d %H:%M' в русский текст."""
     try:
         date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
@@ -45,7 +44,6 @@ def format_date(date_str):
         5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
         9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
     }
-
     weekday_ru = days_ru.get(date_obj.strftime('%A'), date_obj.strftime('%A'))
     return f"{weekday_ru}, {date_obj.day} {months_ru[date_obj.month]} {date_obj.year} г."
 
@@ -59,220 +57,287 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = update.message.text.strip()
     weather_info = await get_weather(city)
-
     await update.message.reply_text(weather_info['text'])
-
     if weather_info.get('fig_bytes'):
         buf = io.BytesIO(weather_info['fig_bytes'])
         buf.seek(0)
         await update.message.reply_photo(photo=buf)
 
 
-# ── Оригинальная логика получения данных о стране (из рабочего кода) ────
+# ── Внешние API ───────────────────────────────────────────────────────────
 
-async def get_country_info(country_code):
+async def geonames_search_city(session, city_name):
     """
-    Получает информацию о стране по коду страны с сайта geonames.org.
-    Возвращает словарь с населением и площадью.
+    Ищет город через geonames и возвращает:
+    population (город), country_code, population_country, area_sqkm,
+    currency_code, currency_name.
     """
-    url = f"http://api.geonames.org/countryInfoJSON?country={country_code}&username={GEONAMES_USERNAME}"
-
+    url = 'http://api.geonames.org/searchJSON'
+    params = {
+        'q':            city_name,
+        'maxRows':      5,
+        'featureClass': 'P',
+        'style':        'FULL',
+        'username':     GEONAMES_USERNAME,
+    }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logging.warning(f"Geonames countryInfo API вернул код {response.status}")
-                    return None
-                data = await response.json()
-                if 'geonames' in data and len(data['geonames']) > 0:
-                    country_data = data['geonames'][0]
-                    population   = country_data.get('population')
-                    area_in_sqkm = country_data.get('areaInSqKm')
-                    return {
-                        'population':   int(population)   if population   else None,
-                        'area_in_sqkm': float(area_in_sqkm) if area_in_sqkm else None
-                    }
-                else:
-                    logging.warning("Данные о стране не найдены")
-                    return None
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            logging.info(f"geonames search статус: {resp.status}")
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            items = data.get('geonames', [])
+            if not items:
+                logging.warning(f"geonames search: город {city_name} не найден")
+                return None
+            # Берём город с наибольшим населением
+            best = max(items, key=lambda x: int(x.get('population', 0) or 0))
+            logging.info(f"geonames: найден {best.get('name')}, pop={best.get('population')}, country={best.get('countryCode')}")
+            return {
+                'city_population': int(best['population']) if best.get('population') else None,
+                'country_code':    best.get('countryCode', ''),
+            }
     except Exception as e:
-        logging.error(f"Ошибка при получении данных о стране: {e}")
+        logging.error(f"geonames search ошибка: {e}")
         return None
 
 
-async def get_city_population(city_name):
-    """
-    Получает код страны города через Geocoding API OpenWeatherMap.
-    Всегда возвращает tuple (population, country_code).
-    """
-    url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name}&limit=1&appid={OPENWEATHERMAP_API_KEY}"
-
+async def geonames_country_info(session, country_code):
+    """Возвращает население страны, площадь, код и название валюты."""
+    url = 'http://api.geonames.org/countryInfoJSON'
+    params = {'country': country_code, 'username': GEONAMES_USERNAME}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logging.warning(f"Geocoding API вернул код {response.status}")
-                    return None, None
-                data = await response.json()
-                if not data or not isinstance(data, list) or len(data) == 0:
-                    logging.warning("Город не найден")
-                    return None, None
-                population   = data[0].get('population')
-                country_code = data[0].get('country')
-                return population, country_code
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            logging.info(f"geonames countryInfo [{country_code}] статус: {resp.status}")
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            items = data.get('geonames', [])
+            if not items:
+                logging.warning(f"geonames countryInfo: нет данных для {country_code}")
+                return None
+            d = items[0]
+            return {
+                'population':    int(d['population'])     if d.get('population')   else None,
+                'area_in_sqkm':  float(d['areaInSqKm'])   if d.get('areaInSqKm')   else None,
+                'currency_code': d.get('currencyCode', ''),
+                'currency_name': d.get('currencyName', ''),
+            }
     except Exception as e:
-        logging.error(f"Ошибка при получении населения города: {e}")
-        return None, None
-
-
-# ── Построение графика ───────────────────────────────────────────────────
-
-def build_forecast_chart(temp_dates, temp_mins, temp_maxs):
-    """Строит график температур. Возвращает PNG-байты или None."""
-    if not temp_dates:
+        logging.error(f"geonames countryInfo ошибка: {e}")
         return None
 
+
+async def get_currency_rate(session, currency_code):
+    """Курс валюты к USD через open.er-api.com (бесплатно, без ключа)."""
+    if not currency_code or currency_code.upper() == 'USD':
+        return None
+    url = 'https://open.er-api.com/v6/latest/USD'
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            rate = data.get('rates', {}).get(currency_code.upper())
+            logging.info(f"Курс USD -> {currency_code}: {rate}")
+            return float(rate) if rate else None
+    except Exception as e:
+        logging.error(f"ExchangeRate ошибка: {e}")
+        return None
+
+
+# ── График ────────────────────────────────────────────────────────────────
+
+def build_forecast_chart(hourly_times, hourly_temps, day_labels):
+    """Почасовой график температуры. Возвращает PNG-байты или None."""
+    if not hourly_times or not hourly_temps:
+        return None
     fig = None
     try:
-        df = pd.DataFrame({
-            'Дата': pd.to_datetime(temp_dates),
-            'Мин. температура': temp_mins,
-            'Макс. температура': temp_maxs
-        })
+        sns.set_context("talk", font_scale=1.2)
+        fig, ax = plt.subplots(figsize=(12, 6))
 
-        sns.set_context("talk", font_scale=1.4)
-        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(hourly_times, hourly_temps, color='royalblue', linewidth=2.5,
+                marker='o', markersize=4, label='Температура')
+        ax.fill_between(hourly_times, hourly_temps,
+                        min(hourly_temps) - 2, alpha=0.15, color='royalblue')
 
-        sns.lineplot(x='Дата', y='Мин. температура', data=df,
-                     label='Мин. температура', linewidth=3, color='blue', ax=ax)
-        sns.lineplot(x='Дата', y='Макс. температура', data=df,
-                     label='Макс. температура', linewidth=3, color='red', ax=ax)
+        ylim = ax.get_ylim()
+        for day_date, day_label in day_labels:
+            midnight = datetime.datetime.combine(day_date, datetime.time(0, 0))
+            if hourly_times[0] < midnight < hourly_times[-1]:
+                ax.axvline(x=midnight, color='gray', linestyle='--', linewidth=1, alpha=0.7)
+                ax.text(midnight, ylim[1], day_label,
+                        fontsize=10, color='gray', ha='center', va='bottom')
 
-        ax.set_title('Температуры', fontsize=20)
-        ax.xaxis.set_tick_params(labelsize=14)
-        ax.yaxis.set_tick_params(labelsize=14)
-        plt.xticks(rotation=45)
-        plt.legend(fontsize=16)
+        for t, temp in zip(hourly_times, hourly_temps):
+            if t.hour % 6 == 0:
+                ax.annotate(str(int(round(temp))) + '°', xy=(t, temp),
+                            xytext=(0, 8), textcoords='offset points',
+                            ha='center', fontsize=9, color='navy')
+
+        ax.set_title('Динамика температуры на 2 дня вперёд', fontsize=16, pad=12)
+        ax.set_xlabel('Время', fontsize=13)
+        ax.set_ylabel('Температура (°C)', fontsize=13)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b\n%H:%M'))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+        ax.tick_params(axis='x', labelsize=10, rotation=30)
+        ax.tick_params(axis='y', labelsize=11)
+        ax.legend(fontsize=13)
         plt.tight_layout()
 
         buf = io.BytesIO()
-        plt.savefig(buf, format='png')
+        plt.savefig(buf, format='png', dpi=120)
         buf.seek(0)
         return buf.read()
     except Exception as e:
-        logging.error(f"Ошибка при построении графика: {e}")
+        logging.error(f"График ошибка: {e}")
         return None
     finally:
         if fig is not None:
-            plt.close(fig)  # всегда закрываем — предотвращаем утечку памяти
+            plt.close(fig)
 
 
-# ── Основная функция погоды ──────────────────────────────────────────────
+# ── Основная функция ──────────────────────────────────────────────────────
 
 async def get_weather(city):
-    base_url     = "http://api.weatherapi.com/v1"
-    current_url  = f"{base_url}/current.json"
-    forecast_url = f"{base_url}/forecast.json"
+    base_url     = 'http://api.weatherapi.com/v1'
+    current_url  = base_url + '/current.json'
+    forecast_url = base_url + '/forecast.json'
 
-    params_current = {
-        'key':  WEATHERAPI_KEY,
-        'q':    city,
-        'lang': 'ru'
-    }
-    # Бесплатный тариф WeatherAPI — максимум 3 дня
-    params_forecast = {
-        'key':  WEATHERAPI_KEY,
-        'q':    city,
-        'days': 3,
-        'lang': 'ru'
-    }
+    params_current  = {'key': WEATHERAPI_KEY, 'q': city, 'lang': 'ru'}
+    params_forecast = {'key': WEATHERAPI_KEY, 'q': city, 'days': 3, 'lang': 'ru'}
 
     try:
         async with aiohttp.ClientSession() as session:
 
-            # Текущая погода
-            async with session.get(current_url, params=params_current) as response:
-                if response.status != 200:
-                    return {'text': f"Не удалось получить погоду для города '{city}'. Проверьте название.", 'fig_bytes': None}
-                data_current = await response.json()
+            # ── Погода сейчас ───────────────────────────────────────────
+            async with session.get(current_url, params=params_current,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return {
+                        'text': "Не удалось получить погоду для «" + city + "». Проверьте название.",
+                        'fig_bytes': None
+                    }
+                data_current = await resp.json(content_type=None)
 
             location_name     = data_current['location']['name']
             country_name_full = data_current['location'].get('country', '')
             temp_c            = data_current['current']['temp_c']
             condition_text    = data_current['current']['condition']['text']
-            localtime_str     = data_current['location'].get('localtime')
+            localtime_str     = data_current['location'].get('localtime', '')
+            formatted_date    = format_date(localtime_str) if localtime_str else 'Дата недоступна'
 
-            if localtime_str:
-                formatted_date_full = format_date(localtime_str)
-                date_part = localtime_str.split(' ')[0]
-                is_today  = (date_part == datetime.datetime.now().strftime('%Y-%m-%d'))
-            else:
-                formatted_date_full = "Дата недоступна"
-                is_today = False
+            # ── Прогноз ────────────────────────────────────────────────
+            async with session.get(forecast_url, params=params_forecast,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp_f:
+                if resp_f.status != 200:
+                    return {
+                        'text': "Не удалось получить прогноз для «" + city + "».",
+                        'fig_bytes': None
+                    }
+                forecast_data = await resp_f.json(content_type=None)
 
-            # Прогноз
-            async with session.get(forecast_url, params=params_forecast) as response_forecast:
-                if response_forecast.status != 200:
-                    return {'text': f"Не удалось получить прогноз для города '{city}'.", 'fig_bytes': None}
-                forecast_data = await response_forecast.json()
+            # ── Данные о городе и стране через Geonames ─────────────────
+            city_info    = await geonames_search_city(session, location_name)
+            country_info = None
+            city_pop     = None
+            country_code = None
 
-        # Парсим прогноз (вне сессии — данные уже получены)
-        forecast_lines = []
-        temp_dates, temp_mins, temp_maxs = [], [], []
+            if city_info:
+                city_pop     = city_info.get('city_population')
+                country_code = city_info.get('country_code')
+                if country_code:
+                    country_info = await geonames_country_info(session, country_code)
 
-        for day in forecast_data['forecast']['forecastday']:
-            date_str_raw = day['date']
-            date_obj_day = datetime.datetime.strptime(date_str_raw, '%Y-%m-%d').date()
+            # ── Курс валюты ─────────────────────────────────────────────
+            currency_rate = None
+            currency_code_str = ''
+            currency_name_str = ''
+            if country_info:
+                currency_code_str = country_info.get('currency_code', '')
+                currency_name_str = country_info.get('currency_name', '')
+                if currency_code_str and currency_code_str != 'USD':
+                    currency_rate = await get_currency_rate(session, currency_code_str)
 
-            # Пропускаем прошедшие дни; сегодня включаем
-            if date_obj_day < datetime.date.today():
-                continue
+            # ── Парсим прогноз ──────────────────────────────────────────
+            forecast_lines = []
+            hourly_times   = []
+            hourly_temps   = []
+            day_labels     = []
+            today          = datetime.date.today()
 
-            min_temp = int(round(day['day']['mintemp_c']))
-            max_temp = int(round(day['day']['maxtemp_c']))
-            desc     = day['day']['condition']['text']
+            for day in forecast_data['forecast']['forecastday']:
+                date_str_raw = day['date']
+                date_obj_day = datetime.datetime.strptime(date_str_raw, '%Y-%m-%d').date()
 
-            label = "Сегодня" if date_obj_day == datetime.date.today() else format_date(date_str_raw)
-            forecast_lines.append(
-                f"{label}: {desc}, от {min_temp}°C ночью до {max_temp}°C днем."
+                if date_obj_day < today:
+                    continue
+
+                min_temp = int(round(day['day']['mintemp_c']))
+                max_temp = int(round(day['day']['maxtemp_c']))
+                desc     = day['day']['condition']['text']
+                label    = 'Сегодня' if date_obj_day == today else format_date(date_str_raw)
+
+                forecast_lines.append(
+                    label + ': ' + desc + ', от ' + str(min_temp) + '°C ночью до ' + str(max_temp) + '°C днём.'
+                )
+
+                if 'hour' in day:
+                    if date_obj_day != today:
+                        day_labels.append((date_obj_day, label))
+                    for h in day['hour']:
+                        try:
+                            dt = datetime.datetime.strptime(h['time'], '%Y-%m-%d %H:%M')
+                            hourly_times.append(dt)
+                            hourly_temps.append(h['temp_c'])
+                        except Exception:
+                            continue
+
+            # ── Строки с данными ────────────────────────────────────────
+            logging.info("city_info=%s city_pop=%s country_code=%s country_info=%s",
+                         city_info, city_pop, country_code, country_info)
+
+            city_pop_str = ''
+            if city_pop:
+                city_pop_str = '\nНаселение города: ' + '{:,}'.format(city_pop) + ' чел.'
+
+            country_str = ''
+            if country_info and country_info.get('population') and country_info.get('area_in_sqkm'):
+                country_str = (
+                    '\nНаселение страны: ' + '{:,}'.format(country_info['population']) + ' чел.'
+                    + '\nПлощадь страны: ' + '{:,}'.format(country_info['area_in_sqkm']) + ' км²'
+                )
+
+            currency_str = ''
+            if currency_rate and currency_code_str:
+                currency_str = '\n💱 1 USD = ' + '{:.2f}'.format(currency_rate) + ' ' + currency_code_str
+                if currency_name_str:
+                    currency_str += ' (' + currency_name_str + ')'
+
+            # ── Итоговый текст ──────────────────────────────────────────
+            today_line = (
+                '🌤 Погода в ' + location_name + ', ' + country_name_full
+                + city_pop_str
+                + country_str
+                + currency_str + ':\n'
+                + 'Дата: ' + formatted_date + '\n'
+                + 'Температура: ' + str(int(round(temp_c))) + '°C.\n'
+                + 'Состояние: ' + condition_text + '.'
             )
-            temp_dates.append(date_str_raw)
-            temp_mins.append(min_temp)
-            temp_maxs.append(max_temp)
 
-        forecast_str = "\n".join(forecast_lines)
+            forecast_str = '\n'.join(forecast_lines)
+            result_text  = today_line + '\n\nПрогноз на ближайшие 2 дня:\n' + forecast_str
 
-        # Данные о стране — оригинальная логика из рабочего кода
-        population_city, country_code_iso2 = await get_city_population(city)
+            fig_bytes = build_forecast_chart(hourly_times, hourly_temps, day_labels)
 
-        country_info = None
-        if country_code_iso2:
-            country_info = await get_country_info(country_code_iso2)
-
-        if country_info and country_info.get('population') is not None and country_info.get('area_in_sqkm') is not None:
-            population_country     = f"{country_info['population']:,}"
-            area_country           = f"{country_info['area_in_sqkm']:,} км²"
-            population_country_str = f"\nНаселение страны: {population_country} чел.\nПлощадь страны: {area_country}"
-        else:
-            population_country_str = ""
-
-        # Формируем текст
-        today_line = (
-            f"🌤 Погода в {location_name}, {country_name_full}{population_country_str}:\n"
-            f"Дата: {formatted_date_full}\n"
-            f"Температура: {int(round(temp_c))}°C.\n"
-            f"Состояние: {condition_text}."
-        )
-
-        result_text = f"{today_line}\n\nПрогноз на ближайшие 2 дня:\n{forecast_str}"
-
-        fig_bytes = build_forecast_chart(temp_dates, temp_mins, temp_maxs)
-
-        return {'text': result_text, 'fig_bytes': fig_bytes}
+            return {'text': result_text, 'fig_bytes': fig_bytes}
 
     except Exception as e:
-        logging.exception(f"Необработанная ошибка в get_weather: {e}")
-        return {'text': f"Произошла ошибка: {e}", 'fig_bytes': None}
+        logging.exception("Необработанная ошибка в get_weather: " + str(e))
+        return {'text': 'Произошла ошибка: ' + str(e), 'fig_bytes': None}
 
 
 def main():
