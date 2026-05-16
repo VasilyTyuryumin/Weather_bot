@@ -92,10 +92,19 @@ async def geonames_search_city(session, city_name):
                 logging.warning(f"geonames search: город {city_name} не найден")
                 return None
             # Берём город с наибольшим населением
-            best = max(items, key=lambda x: int(x.get('population', 0) or 0))
-            logging.info(f"geonames: найден {best.get('name')}, pop={best.get('population')}, country={best.get('countryCode')}")
+            def safe_pop(x):
+                try:
+                    return int(x.get('population') or 0)
+                except (ValueError, TypeError):
+                    return 0
+
+            best = max(items, key=safe_pop)
+            pop_val = safe_pop(best)
+            logging.info(
+                f"geonames: выбран {best.get('name')}, pop={pop_val}, country={best.get('countryCode')}"
+            )
             return {
-                'city_population': int(best['population']) if best.get('population') else None,
+                'city_population': pop_val if pop_val > 0 else None,
                 'country_code':    best.get('countryCode', ''),
             }
     except Exception as e:
@@ -131,21 +140,36 @@ async def geonames_country_info(session, country_code):
 
 
 async def get_currency_rate(session, currency_code):
-    """Курс валюты к USD через open.er-api.com (бесплатно, без ключа)."""
+    """Курс валюты к USD. Пробует open.er-api.com, затем frankfurter.app."""
     if not currency_code or currency_code.upper() == 'USD':
         return None
-    url = 'https://open.er-api.com/v6/latest/USD'
+    code = currency_code.upper()
+    # Источник 1: open.er-api.com
     try:
+        url = 'https://open.er-api.com/v6/latest/USD'
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json(content_type=None)
-            rate = data.get('rates', {}).get(currency_code.upper())
-            logging.info(f"Курс USD -> {currency_code}: {rate}")
-            return float(rate) if rate else None
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                rate = data.get('rates', {}).get(code)
+                if rate:
+                    logging.info(f"open.er-api: USD -> {code} = {rate}")
+                    return float(rate)
     except Exception as e:
-        logging.error(f"ExchangeRate ошибка: {e}")
-        return None
+        logging.warning(f"open.er-api ошибка: {e}")
+    # Источник 2: frankfurter.app (резерв)
+    try:
+        url2 = f"https://api.frankfurter.app/latest?from=USD&to={code}"
+        async with session.get(url2, timeout=aiohttp.ClientTimeout(total=6)) as resp2:
+            if resp2.status == 200:
+                data2 = await resp2.json(content_type=None)
+                rate2 = data2.get('rates', {}).get(code)
+                if rate2:
+                    logging.info(f"frankfurter: USD -> {code} = {rate2}")
+                    return float(rate2)
+    except Exception as e:
+        logging.warning(f"frankfurter ошибка: {e}")
+    logging.error(f"Не удалось получить курс для {code}")
+    return None
 
 
 # ── График ────────────────────────────────────────────────────────────────
